@@ -11,11 +11,7 @@ from typing import Any, Dict, Optional, Tuple, List
 from datetime import datetime
 
 import requests
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -37,14 +33,13 @@ AJAX_URL = f"{DTEK_BASE}/ua/ajax"
 METHOD = "getHomeNum"
 
 DEFAULT_CHECK_SECONDS = 90
-
-# Файл із довідником міст/вулиць (JSON)
 ADDRESSES_FILE = os.environ.get("ADDRESSES_FILE", "adresses.txt")
 
 # Conversation states
 ASK_CITY, ASK_STREET_QUERY, ASK_STREET_PICK, ASK_HOUSE, ASK_INTERVAL = range(5)
 
 SESSION = requests.Session()
+SESSION.trust_env = False  # важливо: не підхоплювати proxy з env (часто ламає на хостингах)
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -77,6 +72,7 @@ EMO = {
     "info": "ℹ️",
     "pin": "📍",
     "sparkles": "✨",
+    "refresh": "🔄",
 }
 
 BTN = {
@@ -98,7 +94,6 @@ class Address:
     house: str
 
 
-# -------- helpers --------
 def normalize_house(h: str) -> str:
     return h.strip()
 
@@ -159,9 +154,8 @@ def format_status(addr: Address, house_obj: Optional[Dict[str, Any]], update_ts:
     )
 
 
-def fingerprint(house_obj: Optional[Dict[str, Any]], update_ts: str) -> str:
-    raw = json.dumps({"house": house_obj, "updateTimestamp": update_ts}, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _parse_csrf_from_html(html: str) -> Optional[str]:
@@ -279,7 +273,6 @@ def _main_menu_kb() -> ReplyKeyboardMarkup:
 
 
 def _parse_interval(text: str) -> Optional[int]:
-    # дозволяємо: "90", "90с", "90 сек", "2хв", "2 хв", "5м", "5 min"
     t = (text or "").strip().lower()
     m = re.match(r"^(\d{1,4})\s*(с|сек|секунд|s|sec)?$", t)
     if m:
@@ -298,24 +291,18 @@ def _parse_interval(text: str) -> Optional[int]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"{EMO['sparkles']} DTEK-бот для перевірки відключень.\n\n"
-        f"Команди:\n"
-        f"/set — налаштувати адресу\n"
-        f"/status — показати статус\n"
-        f"/interval — змінити інтервал перевірки\n"
-        f"/stop — вимкнути сповіщення\n\n"
-        f"Можеш також користуватись кнопками нижче.",
+        f"{EMO['gear']} /set — налаштувати адресу\n"
+        f"{EMO['info']} /status — показати статус\n"
+        f"{EMO['clock']} /interval — змінити інтервал перевірки\n"
+        f"{EMO['stop']} /stop — вимкнути сповіщення\n\n"
+        f"{EMO['list']} Можеш також користуватись кнопками нижче.",
         reply_markup=_main_menu_kb(),
     )
-
-
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(f"{EMO['list']} Меню:", reply_markup=_main_menu_kb())
 
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     book: Dict[str, List[str]] = context.application.bot_data.get("addr_book", {})
     cities = sorted(book.keys(), key=lambda x: x.lower())
-
     if not cities:
         await update.message.reply_text(f"{EMO['warn']} Довідник адрес порожній/не завантажився.")
         return ConversationHandler.END
@@ -360,7 +347,7 @@ async def on_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("street", None)
 
     await update.message.reply_text(
-        f"{EMO['search']} Введи частину назви вулиці (наприклад: Вадатурського або Варнен):",
+        f"{EMO['search']} Введи частину назви вулиці:",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ASK_STREET_QUERY
@@ -383,11 +370,7 @@ async def on_street_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ASK_STREET_QUERY
 
     context.user_data["street_matches"] = matches
-    kb = ReplyKeyboardMarkup(
-        [[s] for s in matches] + [[BTN["cancel"]]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    kb = ReplyKeyboardMarkup([[s] for s in matches] + [[BTN["cancel"]]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(f"{EMO['road']} Обери вулицю зі списку:", reply_markup=kb)
     return ASK_STREET_PICK
 
@@ -437,21 +420,20 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         api_json = fetch_dtek(city, street)
         house_obj, ts = extract_house(api_json, house)
         msg = format_status(addr, house_obj, ts)
-        fp = fingerprint(house_obj, ts)
     except Exception as e:
         log.exception("fetch failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
         return ConversationHandler.END
 
+    # ВАЖЛИВО: тепер слідкуємо саме за текстом повідомлення.
+    # Якщо змінюється будь-що (часи, тип, коди, тощо) — буде нове сповіщення.
     context.user_data["addr"] = {"city": city, "street": street, "house": house}
-    context.user_data["last_fp"] = fp
+    context.user_data["last_msg_hash"] = _hash_text(msg)
 
-    # Інтервал може бути індивідуальним для користувача
     interval = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
 
     await update.message.reply_text(msg, reply_markup=_main_menu_kb())
     await _restart_watch_job(context, update.effective_user.id, update.effective_chat.id, interval)
-
     await update.message.reply_text(
         f"{EMO['bell']} Сповіщення увімкнено.\n{EMO['clock']} Перевірка кожні {interval} с.",
         reply_markup=_main_menu_kb(),
@@ -469,8 +451,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
-        await update.message.reply_text(format_status(addr, house_obj, ts), reply_markup=_main_menu_kb())
-        context.user_data["last_fp"] = fingerprint(house_obj, ts)
+        msg = format_status(addr, house_obj, ts)
+        await update.message.reply_text(msg, reply_markup=_main_menu_kb())
+        context.user_data["last_msg_hash"] = _hash_text(msg)
     except Exception as e:
         log.exception("status failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
@@ -500,7 +483,7 @@ async def interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     await update.message.reply_text(
         f"{EMO['clock']} Поточний інтервал: {current} с.\n"
-        f"Вибери або введи свій (від 15 с до 3600 с):",
+        f"Вибери або введи свій (15..3600 с):",
         reply_markup=kb,
     )
     return ASK_INTERVAL
@@ -537,7 +520,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_data = context.application.user_data.get(user_id) or {}
     addr_dict = user_data.get("addr")
-    last_fp = user_data.get("last_fp")
+    last_hash = user_data.get("last_msg_hash")
     if not addr_dict:
         return
 
@@ -546,20 +529,25 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
-        new_fp = fingerprint(house_obj, ts)
 
-        if new_fp != last_fp:
-            user_data["last_fp"] = new_fp
+        msg = format_status(addr, house_obj, ts)
+        new_hash = _hash_text(msg)
+
+        # ГОЛОВНА ЗМІНА:
+        # якщо змінився ТЕКСТ повідомлення (наприклад час включення/відключення),
+        # то автоматично надсилаємо нове повідомлення.
+        if new_hash != last_hash:
+            user_data["last_msg_hash"] = new_hash
             context.application.user_data[user_id] = user_data
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{EMO['bell']} Зміни у відключеннях:\n\n" + format_status(addr, house_obj, ts),
+                text=f"{EMO['refresh']} Оновлення:\n\n{msg}",
             )
+
     except Exception:
         log.exception("watch job failed")
 
 
-# -------- Text-button handlers (menu buttons) --------
 async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     text = (update.message.text or "").strip()
 
@@ -573,9 +561,6 @@ async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
     if text == BTN["interval"]:
         return await interval_cmd(update, context)
-    if text == BTN["menu"]:
-        await menu_cmd(update, context)
-        return ConversationHandler.END
 
     return None
 
@@ -583,62 +568,47 @@ async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        raise SystemExit("cmd: set BOT_TOKEN=123456:ABC...")
+        raise SystemExit("Set BOT_TOKEN env var, e.g. export BOT_TOKEN=123456:ABC...")
 
     addr_book = load_address_book(ADDRESSES_FILE)
 
     app = ApplicationBuilder().token(token).build()
     app.bot_data["addr_book"] = addr_book
 
-    # Conversation for setting address
     conv_set = ConversationHandler(
         entry_points=[
             CommandHandler("set", set_cmd),
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(rf"^{re.escape(BTN['set'])}$"), set_cmd),
         ],
         states={
-            ASK_CITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_city),
-            ],
-            ASK_STREET_QUERY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_street_query),
-            ],
-            ASK_STREET_PICK: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_street_pick),
-            ],
-            ASK_HOUSE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_house),
-            ],
+            ASK_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_city)],
+            ASK_STREET_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_street_query)],
+            ASK_STREET_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_street_pick)],
+            ASK_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_house)],
         },
-        fallbacks=[
-            CommandHandler("stop", stop_cmd),
-        ],
+        fallbacks=[CommandHandler("stop", stop_cmd)],
         allow_reentry=True,
     )
 
-    # Conversation for interval
     conv_interval = ConversationHandler(
         entry_points=[
             CommandHandler("interval", interval_cmd),
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(rf"^{re.escape(BTN['interval'])}$"), interval_cmd),
         ],
         states={
-            ASK_INTERVAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_interval),
-            ],
+            ASK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_interval)],
         },
         fallbacks=[CommandHandler("stop", stop_cmd)],
         allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(conv_set)
     app.add_handler(conv_interval)
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
 
-    # Universal menu buttons (when not inside conversations)
+    # кнопки меню поза сценаріями
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_buttons))
 
     app.run_polling(close_loop=False)
