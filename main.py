@@ -123,7 +123,15 @@ def init_db() -> None:
             )
 
 
-def save_user_address(user_id: int, chat_id: int, city: str, street: str, house: str, interval_seconds: int, last_status_text: str) -> None:
+def save_user_address(
+    user_id: int,
+    chat_id: int,
+    city: str,
+    street: str,
+    house: str,
+    interval_seconds: int,
+    last_status_text: str,
+) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -277,15 +285,9 @@ def _fmt_dt(s: str) -> str:
     return s.strip() if (s or "").strip() else "—"
 
 
-def format_status(addr: Address, house_obj: Optional[Dict[str, Any]], update_ts: str) -> str:
-    header = (
-        f"{EMO['pin']} Адреса: {addr.city}, {addr.street}, буд. {addr.house}\n"
-        f"{EMO['clock']} Оновлено: {_fmt_dt(update_ts)}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-    )
-
+def format_status_body(house_obj: Optional[Dict[str, Any]]) -> str:
     if house_obj is None:
-        return header + f"{EMO['warn']} Будинок не знайдено у відповіді. Перевір номер/літеру (14А, 18Г/1)."
+        return f"{EMO['warn']} Будинок не знайдено у відповіді. Перевір номер/літеру (14А, 18Г/1)."
 
     sub_type = (house_obj.get("sub_type") or "").strip()
     start_date = (house_obj.get("start_date") or "").strip()
@@ -294,20 +296,34 @@ def format_status(addr: Address, house_obj: Optional[Dict[str, Any]], update_ts:
     reasons_txt = ", ".join(str(x) for x in reasons if x)
 
     if sub_type and start_date and end_date:
-        return (
-            header
-            + f"{EMO['bolt']} Статус: ВІДКЛЮЧЕННЯ\n"
-            + f"{EMO['plug']} Тип: {sub_type}\n"
-            + f"🟢 Початок: {start_date}\n"
-            + f"🔴 Кінець: {end_date}\n"
-            + (f"{EMO['info']} Код(и): {reasons_txt}\n" if reasons_txt else "")
+        body = (
+            f"{EMO['bolt']} Статус: ВІДКЛЮЧЕННЯ\n"
+            f"{EMO['plug']} Тип: {sub_type}\n"
+            f"🟢 Початок: {start_date}\n"
+            f"🔴 Кінець: {end_date}\n"
         )
+        if reasons_txt:
+            body += f"{EMO['info']} Код(и): {reasons_txt}\n"
+        return body.rstrip()
 
-    return (
-        header
-        + f"{EMO['check']} Статус: немає активного відключення.\n"
-        + (f"{EMO['info']} Код(и): {reasons_txt}\n" if reasons_txt else "")
+    body = f"{EMO['check']} Статус: немає активного відключення.\n"
+    if reasons_txt:
+        body += f"{EMO['info']} Код(и): {reasons_txt}\n"
+    return body.rstrip()
+
+
+def format_status(addr: Address, house_obj: Optional[Dict[str, Any]], update_ts: str) -> str:
+    header = (
+        f"{EMO['pin']} Адреса: {addr.city}, {addr.street}, буд. {addr.house}\n"
+        f"{EMO['clock']} Оновлено: {_fmt_dt(update_ts)}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
     )
+    return header + format_status_body(house_obj)
+
+
+def get_comparable_status_text(house_obj: Optional[Dict[str, Any]]) -> str:
+    # Для порівняння ігноруємо updateTimestamp / "Оновлено"
+    return format_status_body(house_obj)
 
 
 def _parse_csrf_from_html(html: str) -> Optional[str]:
@@ -583,7 +599,8 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         api_json = fetch_dtek(city, street)
         house_obj, ts = extract_house(api_json, house)
-        msg = format_status(addr, house_obj, ts)
+        visible_msg = format_status(addr, house_obj, ts)
+        comparable_msg = get_comparable_status_text(house_obj)
     except Exception as e:
         log.exception("fetch failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
@@ -592,7 +609,7 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     interval = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
 
     context.user_data["addr"] = {"city": city, "street": street, "house": house}
-    context.user_data["last_status_text"] = msg
+    context.user_data["last_status_text"] = comparable_msg
     context.user_data["interval"] = interval
 
     save_user_address(
@@ -602,10 +619,10 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         street=street,
         house=house,
         interval_seconds=interval,
-        last_status_text=msg,
+        last_status_text=comparable_msg,
     )
 
-    await update.message.reply_text(msg, reply_markup=_main_menu_kb())
+    await update.message.reply_text(visible_msg, reply_markup=_main_menu_kb())
     await _restart_watch_job(context, update.effective_user.id, update.effective_chat.id, interval)
     await update.message.reply_text(
         f"{EMO['bell']} Сповіщення увімкнено.\n"
@@ -633,15 +650,17 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
-        msg = format_status(addr, house_obj, ts)
 
-        await update.message.reply_text(msg, reply_markup=_main_menu_kb())
+        visible_msg = format_status(addr, house_obj, ts)
+        comparable_msg = get_comparable_status_text(house_obj)
+
+        await update.message.reply_text(visible_msg, reply_markup=_main_menu_kb())
 
         context.user_data["addr"] = {"city": addr.city, "street": addr.street, "house": addr.house}
-        context.user_data["last_status_text"] = msg
+        context.user_data["last_status_text"] = comparable_msg
         context.user_data["interval"] = record["interval_seconds"]
 
-        update_user_last_status(user_id, msg)
+        update_user_last_status(user_id, comparable_msg)
     except Exception as e:
         log.exception("status failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
@@ -741,18 +760,20 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
-        msg = format_status(addr, house_obj, ts)
+
+        visible_msg = format_status(addr, house_obj, ts)
+        comparable_msg = get_comparable_status_text(house_obj)
 
         old_text = record.get("last_status_text")
-        changed = msg != old_text
+        changed = comparable_msg != old_text
 
         log.info("check_job: user_id=%s changed=%s", user_id, changed)
 
         if changed:
-            update_user_last_status(user_id, msg)
+            update_user_last_status(user_id, comparable_msg)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{EMO['refresh']} Оновлення розкладу:\n\n{msg}",
+                text=f"{EMO['refresh']} Оновлення розкладу:\n\n{visible_msg}",
             )
             log.info("check_job: update sent to user_id=%s", user_id)
 
