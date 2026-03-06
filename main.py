@@ -678,7 +678,41 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{EMO['stop']} Сповіщення вимкнено." if jobs else f"{EMO['info']} Сповіщення не активні.",
         reply_markup=_main_menu_kb(),
     )
+ADMIN_ID = 922075489
 
+async def sms_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Немає доступу")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Використання:\n"
+            "/sms текст повідомлення"
+        )
+        return
+
+    text = " ".join(context.args)
+
+    users = get_all_enabled_users()
+
+    sent = 0
+    failed = 0
+
+    for user in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user["chat_id"],
+                text=f"📢 Повідомлення від бота:\n\n{text}"
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(
+        f"✅ Надіслано: {sent}\n"
+        f"❌ Помилки: {failed}"
+    )
 
 async def interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     record = get_user_record(update.effective_user.id)
@@ -868,6 +902,7 @@ def main() -> None:
     app.add_handler(conv_interval)
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("sms", sms_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_buttons))
 
     app.run_polling(close_loop=False)
@@ -875,3 +910,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
