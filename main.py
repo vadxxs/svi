@@ -35,11 +35,10 @@ METHOD = "getHomeNum"
 DEFAULT_CHECK_SECONDS = 90
 ADDRESSES_FILE = os.environ.get("ADDRESSES_FILE", "adresses.txt")
 
-# Conversation states
 ASK_CITY, ASK_STREET_QUERY, ASK_STREET_PICK, ASK_HOUSE, ASK_INTERVAL = range(5)
 
 SESSION = requests.Session()
-SESSION.trust_env = False  # важливо: не підхоплювати proxy з env (часто ламає на хостингах)
+SESSION.trust_env = False
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -50,7 +49,6 @@ BASE_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
 }
 
-# -------- UI strings --------
 EMO = {
     "bolt": "⚡",
     "plug": "🔌",
@@ -79,7 +77,6 @@ BTN = {
     "next": f"{EMO['next']} Далі",
     "back": f"{EMO['back']} Назад",
     "cancel": f"{EMO['cancel']} Скасувати",
-    "menu": f"{EMO['list']} Меню",
     "set": f"{EMO['gear']} Налаштувати адресу",
     "status": f"{EMO['info']} Статус",
     "stop": f"{EMO['stop']} Вимкнути сповіщення",
@@ -154,8 +151,26 @@ def format_status(addr: Address, house_obj: Optional[Dict[str, Any]], update_ts:
     )
 
 
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def make_state_snapshot(house_obj: Optional[Dict[str, Any]], update_ts: str) -> Dict[str, Any]:
+    if house_obj is None:
+        return {
+            "exists": False,
+            "update_ts": (update_ts or "").strip(),
+        }
+
+    return {
+        "exists": True,
+        "update_ts": (update_ts or "").strip(),
+        "sub_type": (house_obj.get("sub_type") or "").strip(),
+        "start_date": (house_obj.get("start_date") or "").strip(),
+        "end_date": (house_obj.get("end_date") or "").strip(),
+        "reasons": list(house_obj.get("sub_type_reason") or []),
+    }
+
+
+def hash_snapshot(snapshot: Dict[str, Any]) -> str:
+    raw = json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _parse_csrf_from_html(html: str) -> Optional[str]:
@@ -208,7 +223,6 @@ def job_name(user_id: int) -> str:
     return f"watch:{user_id}"
 
 
-# -------- Address book --------
 def load_address_book(path: str) -> Dict[str, List[str]]:
     try_paths = [path]
     if not os.path.isabs(path):
@@ -241,16 +255,14 @@ def _top_matches(streets: List[str], query: str, limit: int = 25) -> List[str]:
     q = _normalize_for_search(query)
     if not q:
         return []
-    res = [s for s in streets if q in _normalize_for_search(s)]
-    return res[:limit]
+    return [s for s in streets if q in _normalize_for_search(s)][:limit]
 
 
 def _chunk_keyboard(items: List[str], page: int, page_size: int) -> ReplyKeyboardMarkup:
     start = page * page_size
-    chunk = items[start : start + page_size]
+    chunk = items[start:start + page_size]
 
     rows: List[List[str]] = [[s] for s in chunk]
-
     nav: List[str] = []
     if page > 0:
         nav.append(BTN["back"])
@@ -287,15 +299,13 @@ def _parse_interval(text: str) -> Optional[int]:
     return None
 
 
-# -------- Telegram handlers --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"{EMO['sparkles']} DTEK-бот для перевірки відключень.\n\n"
-        f"{EMO['gear']} /set — налаштувати адресу\n"
-        f"{EMO['info']} /status — показати статус\n"
-        f"{EMO['clock']} /interval — змінити інтервал перевірки\n"
-        f"{EMO['stop']} /stop — вимкнути сповіщення\n\n"
-        f"{EMO['list']} Можеш також користуватись кнопками нижче.",
+        f"/set — налаштувати адресу\n"
+        f"/status — показати статус\n"
+        f"/interval — змінити інтервал перевірки\n"
+        f"/stop — вимкнути сповіщення",
         reply_markup=_main_menu_kb(),
     )
 
@@ -304,7 +314,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     book: Dict[str, List[str]] = context.application.bot_data.get("addr_book", {})
     cities = sorted(book.keys(), key=lambda x: x.lower())
     if not cities:
-        await update.message.reply_text(f"{EMO['warn']} Довідник адрес порожній/не завантажився.")
+        await update.message.reply_text(f"{EMO['warn']} Довідник адрес порожній.")
         return ConversationHandler.END
 
     context.user_data["city_page"] = 0
@@ -340,7 +350,6 @@ async def on_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if text not in book:
         await update.message.reply_text(f"{EMO['warn']} Обери пункт з клавіатури.")
-        await update.message.reply_text(f"{EMO['city']} Обери населений пункт:", reply_markup=_chunk_keyboard(cities, page, 15))
         return ASK_CITY
 
     context.user_data["city"] = text
@@ -366,7 +375,7 @@ async def on_street_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     matches = _top_matches(streets, q, limit=25)
     if not matches:
-        await update.message.reply_text(f"{EMO['warn']} Нічого не знайдено. Спробуй іншу частину назви або надішли {BTN['cancel']}.")
+        await update.message.reply_text(f"{EMO['warn']} Нічого не знайдено. Спробуй іншу частину назви.")
         return ASK_STREET_QUERY
 
     context.user_data["street_matches"] = matches
@@ -384,18 +393,18 @@ async def on_street_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     matches: List[str] = context.user_data.get("street_matches") or []
     if text not in matches:
-        await update.message.reply_text(f"{EMO['warn']} Обери вулицю з клавіатури або введи пошук ще раз.")
-        await update.message.reply_text(f"{EMO['search']} Введи частину назви вулиці:", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(f"{EMO['warn']} Обери вулицю з клавіатури.")
         return ASK_STREET_QUERY
 
     context.user_data["street"] = text
-    await update.message.reply_text(f"{EMO['home']} Введи номер будинку (наприклад: 14А або 18Г/1):", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(f"{EMO['home']} Введи номер будинку:", reply_markup=ReplyKeyboardRemove())
     return ASK_HOUSE
 
 
 async def _restart_watch_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int, interval: int) -> None:
     for j in context.application.job_queue.get_jobs_by_name(job_name(user_id)):
         j.schedule_removal()
+
     context.application.job_queue.run_repeating(
         check_job,
         interval=interval,
@@ -403,6 +412,7 @@ async def _restart_watch_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, c
         name=job_name(user_id),
         data={"user_id": user_id, "chat_id": chat_id},
     )
+    log.info("watch job restarted: user_id=%s interval=%s", user_id, interval)
 
 
 async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -419,16 +429,15 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         api_json = fetch_dtek(city, street)
         house_obj, ts = extract_house(api_json, house)
+        snapshot = make_state_snapshot(house_obj, ts)
         msg = format_status(addr, house_obj, ts)
     except Exception as e:
         log.exception("fetch failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
         return ConversationHandler.END
 
-    # ВАЖЛИВО: тепер слідкуємо саме за текстом повідомлення.
-    # Якщо змінюється будь-що (часи, тип, коди, тощо) — буде нове сповіщення.
     context.user_data["addr"] = {"city": city, "street": street, "house": house}
-    context.user_data["last_msg_hash"] = _hash_text(msg)
+    context.user_data["last_state_hash"] = hash_snapshot(snapshot)
 
     interval = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
 
@@ -444,7 +453,7 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     addr_dict = context.user_data.get("addr")
     if not addr_dict:
-        await update.message.reply_text(f"{EMO['warn']} Адресу не задано. Натисни {BTN['set']} або /set", reply_markup=_main_menu_kb())
+        await update.message.reply_text(f"{EMO['warn']} Адресу не задано. Використай /set", reply_markup=_main_menu_kb())
         return
 
     addr = Address(**addr_dict)
@@ -453,7 +462,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         house_obj, ts = extract_house(api_json, addr.house)
         msg = format_status(addr, house_obj, ts)
         await update.message.reply_text(msg, reply_markup=_main_menu_kb())
-        context.user_data["last_msg_hash"] = _hash_text(msg)
     except Exception as e:
         log.exception("status failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
@@ -498,17 +506,14 @@ async def on_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     v = _parse_interval(text)
     if v is None:
-        await update.message.reply_text(f"{EMO['warn']} Невірний формат. Приклади: 90, 60 с, 2 хв, 5 хв.")
+        await update.message.reply_text(f"{EMO['warn']} Невірний формат.")
         return ASK_INTERVAL
 
     context.user_data["interval"] = v
 
-    # якщо вже є активний job — перезапустити з новим інтервалом
     addr = context.user_data.get("addr")
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
     if addr:
-        await _restart_watch_job(context, user_id, chat_id, v)
+        await _restart_watch_job(context, update.effective_user.id, update.effective_chat.id, v)
 
     await update.message.reply_text(f"{EMO['check']} Інтервал встановлено: {v} с.", reply_markup=_main_menu_kb())
     return ConversationHandler.END
@@ -518,10 +523,15 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = context.job.data["user_id"]
     chat_id = context.job.data["chat_id"]
 
-    user_data = context.application.user_data.get(user_id) or {}
+    user_data = context.application.user_data.get(user_id)
+    if not user_data:
+        log.info("check_job: no user_data for user_id=%s", user_id)
+        return
+
     addr_dict = user_data.get("addr")
-    last_hash = user_data.get("last_msg_hash")
+    old_hash = user_data.get("last_state_hash")
     if not addr_dict:
+        log.info("check_job: no addr for user_id=%s", user_id)
         return
 
     addr = Address(**addr_dict)
@@ -530,25 +540,32 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
 
-        msg = format_status(addr, house_obj, ts)
-        new_hash = _hash_text(msg)
+        snapshot = make_state_snapshot(house_obj, ts)
+        new_hash = hash_snapshot(snapshot)
 
-        # ГОЛОВНА ЗМІНА:
-        # якщо змінився ТЕКСТ повідомлення (наприклад час включення/відключення),
-        # то автоматично надсилаємо нове повідомлення.
-        if new_hash != last_hash:
-            user_data["last_msg_hash"] = new_hash
-            context.application.user_data[user_id] = user_data
+        log.info(
+            "check_job: user_id=%s old_hash=%s new_hash=%s snapshot=%s",
+            user_id,
+            old_hash,
+            new_hash,
+            snapshot,
+        )
+
+        if new_hash != old_hash:
+            user_data["last_state_hash"] = new_hash
+            msg = format_status(addr, house_obj, ts)
+
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{EMO['refresh']} Оновлення:\n\n{msg}",
+                text=f"{EMO['refresh']} Оновлення розкладу:\n\n{msg}",
             )
+            log.info("check_job: update sent to user_id=%s", user_id)
 
     except Exception:
         log.exception("watch job failed")
 
 
-async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == BTN["status"]:
@@ -568,7 +585,7 @@ async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        raise SystemExit("Set BOT_TOKEN env var, e.g. export BOT_TOKEN=123456:ABC...")
+        raise SystemExit("Set BOT_TOKEN env var")
 
     addr_book = load_address_book(ADDRESSES_FILE)
 
@@ -607,8 +624,6 @@ def main() -> None:
     app.add_handler(conv_interval)
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
-
-    # кнопки меню поза сценаріями
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_buttons))
 
     app.run_polling(close_loop=False)
