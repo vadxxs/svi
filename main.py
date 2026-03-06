@@ -4,7 +4,6 @@
 import os
 import re
 import json
-import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
@@ -149,28 +148,6 @@ def format_status(addr: Address, house_obj: Optional[Dict[str, Any]], update_ts:
         + f"{EMO['check']} Статус: немає активного відключення.\n"
         + (f"{EMO['info']} Код(и): {reasons_txt}\n" if reasons_txt else "")
     )
-
-
-def make_state_snapshot(house_obj: Optional[Dict[str, Any]], update_ts: str) -> Dict[str, Any]:
-    if house_obj is None:
-        return {
-            "exists": False,
-            "update_ts": (update_ts or "").strip(),
-        }
-
-    return {
-        "exists": True,
-        "update_ts": (update_ts or "").strip(),
-        "sub_type": (house_obj.get("sub_type") or "").strip(),
-        "start_date": (house_obj.get("start_date") or "").strip(),
-        "end_date": (house_obj.get("end_date") or "").strip(),
-        "reasons": list(house_obj.get("sub_type_reason") or []),
-    }
-
-
-def hash_snapshot(snapshot: Dict[str, Any]) -> str:
-    raw = json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
 
 
 def _parse_csrf_from_html(html: str) -> Optional[str]:
@@ -429,7 +406,6 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         api_json = fetch_dtek(city, street)
         house_obj, ts = extract_house(api_json, house)
-        snapshot = make_state_snapshot(house_obj, ts)
         msg = format_status(addr, house_obj, ts)
     except Exception as e:
         log.exception("fetch failed")
@@ -437,7 +413,7 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data["addr"] = {"city": city, "street": street, "house": house}
-    context.user_data["last_state_hash"] = hash_snapshot(snapshot)
+    context.user_data["last_status_text"] = msg
 
     interval = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
 
@@ -461,7 +437,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
         msg = format_status(addr, house_obj, ts)
+
         await update.message.reply_text(msg, reply_markup=_main_menu_kb())
+
+        # Оновлюємо останній текст, щоб бот далі порівнював з актуальним станом
+        context.user_data["last_status_text"] = msg
     except Exception as e:
         log.exception("status failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
@@ -529,7 +509,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     addr_dict = user_data.get("addr")
-    old_hash = user_data.get("last_state_hash")
+    last_text = user_data.get("last_status_text")
     if not addr_dict:
         log.info("check_job: no addr for user_id=%s", user_id)
         return
@@ -540,20 +520,17 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
 
-        snapshot = make_state_snapshot(house_obj, ts)
-        new_hash = hash_snapshot(snapshot)
+        msg = format_status(addr, house_obj, ts)
 
         log.info(
-            "check_job: user_id=%s old_hash=%s new_hash=%s snapshot=%s",
+            "check_job: user_id=%s changed=%s",
             user_id,
-            old_hash,
-            new_hash,
-            snapshot,
+            msg != last_text,
         )
 
-        if new_hash != old_hash:
-            user_data["last_state_hash"] = new_hash
-            msg = format_status(addr, house_obj, ts)
+        if msg != last_text:
+            user_data["last_status_text"] = msg
+            context.application.user_data[user_id] = user_data
 
             await context.bot.send_message(
                 chat_id=chat_id,
