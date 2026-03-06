@@ -480,7 +480,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def set_(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     book: Dict[str, List[str]] = context.application.bot_data.get("addr_book", {})
     cities = sorted(book.keys(), key=lambda x: x.lower())
     if not cities:
@@ -633,7 +633,7 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def status_(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     record = get_user_record(user_id)
 
@@ -666,7 +666,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
 
 
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def stop_(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     jobs = context.application.job_queue.get_jobs_by_name(job_name(user_id))
     for j in jobs:
@@ -680,7 +680,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 ADMIN_ID = 922075489
 
-async def sms_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sms_(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Немає доступу")
         return
@@ -713,6 +713,71 @@ async def sms_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Надіслано: {sent}\n"
         f"❌ Помилки: {failed}"
     )
+async def mirror_text_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or update.effective_user.id == ADMIN_ID:
+        return
+
+    user = update.effective_user
+    text = update.message.text or update.message.caption or ""
+
+    msg = (
+        f"👤 Нове текстове повідомлення\n"
+        f"ID: {user.id}\n"
+        f"Username: @{user.username if user.username else '—'}\n"
+        f"Name: {user.full_name}\n\n"
+        f"💬 {text}"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg)
+    except Exception:
+        log.exception("failed to mirror text to admin")
+
+
+async def mirror_photo_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or update.effective_user.id == ADMIN_ID:
+        return
+
+    user = update.effective_user
+    caption = update.message.caption or ""
+    photo = update.message.photo[-1]
+
+    info = (
+        f"🖼 Нове фото\n"
+        f"ID: {user.id}\n"
+        f"Username: @{user.username if user.username else '—'}\n"
+        f"Name: {user.full_name}\n\n"
+        f"Підпис: {caption or '—'}"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=info)
+        await context.bot.send_photo(chat_id=ADMIN_ID, photo=photo.file_id)
+    except Exception:
+        log.exception("failed to mirror photo to admin")
+
+
+async def mirror_video_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or update.effective_user.id == ADMIN_ID:
+        return
+
+    user = update.effective_user
+    caption = update.message.caption or ""
+    video = update.message.video
+
+    info = (
+        f"🎥 Нове відео\n"
+        f"ID: {user.id}\n"
+        f"Username: @{user.username if user.username else '—'}\n"
+        f"Name: {user.full_name}\n\n"
+        f"Підпис: {caption or '—'}"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=info)
+        await context.bot.send_video(chat_id=ADMIN_ID, video=video.file_id)
+    except Exception:
+        log.exception("failed to mirror video to admin")
 
 async def interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     record = get_user_record(update.effective_user.id)
@@ -904,10 +969,14 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("sms", sms_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_buttons))
-
+    app.add_handler(MessageHandler(filters.PHOTO, mirror_photo_to_admin), group=10)
+    app.add_handler(MessageHandler(filters.VIDEO, mirror_video_to_admin), group=10)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mirror_text_to_admin), group=10)
+    
     app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
     main()
+
 
