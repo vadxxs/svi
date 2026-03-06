@@ -1,5 +1,5 @@
 # bot.py
-# pip install -U python-telegram-bot[job-queue] requests
+# pip install -U python-telegram-bot[job-queue] requests psycopg[binary]
 
 import os
 import re
@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from datetime import datetime
 
+import psycopg
 import requests
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -33,6 +34,7 @@ METHOD = "getHomeNum"
 
 DEFAULT_CHECK_SECONDS = 90
 ADDRESSES_FILE = os.environ.get("ADDRESSES_FILE", "adresses.txt")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 ASK_CITY, ASK_STREET_QUERY, ASK_STREET_PICK, ASK_HOUSE, ASK_INTERVAL = range(5)
 
@@ -62,7 +64,6 @@ EMO = {
     "bell": "🔔",
     "stop": "🛑",
     "search": "🔎",
-    "list": "📋",
     "back": "⬅️",
     "next": "➡️",
     "cancel": "✖️",
@@ -70,6 +71,7 @@ EMO = {
     "pin": "📍",
     "sparkles": "✨",
     "refresh": "🔄",
+    "db": "🗄️",
 }
 
 BTN = {
@@ -89,6 +91,164 @@ class Address:
     street: str
     house: str
 
+
+# =========================
+# DB
+# =========================
+
+def get_db_connection() -> psycopg.Connection:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL не заданий")
+    return psycopg.connect(DATABASE_URL)
+
+
+def init_db() -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    city TEXT,
+                    street TEXT,
+                    house TEXT,
+                    interval_seconds INTEGER NOT NULL DEFAULT 90,
+                    last_status_text TEXT,
+                    notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+
+
+def save_user_address(user_id: int, chat_id: int, city: str, street: str, house: str, interval_seconds: int, last_status_text: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (
+                    user_id, chat_id, city, street, house,
+                    interval_seconds, last_status_text, notifications_enabled, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    chat_id = EXCLUDED.chat_id,
+                    city = EXCLUDED.city,
+                    street = EXCLUDED.street,
+                    house = EXCLUDED.house,
+                    interval_seconds = EXCLUDED.interval_seconds,
+                    last_status_text = EXCLUDED.last_status_text,
+                    notifications_enabled = TRUE,
+                    updated_at = NOW()
+                """,
+                (user_id, chat_id, city, street, house, interval_seconds, last_status_text),
+            )
+
+
+def update_user_last_status(user_id: int, last_status_text: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET last_status_text = %s, updated_at = NOW()
+                WHERE user_id = %s
+                """,
+                (last_status_text, user_id),
+            )
+
+
+def update_user_interval(user_id: int, interval_seconds: int) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET interval_seconds = %s, updated_at = NOW()
+                WHERE user_id = %s
+                """,
+                (interval_seconds, user_id),
+            )
+
+
+def set_notifications_enabled(user_id: int, enabled: bool) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET notifications_enabled = %s, updated_at = NOW()
+                WHERE user_id = %s
+                """,
+                (enabled, user_id),
+            )
+
+
+def get_user_record(user_id: int) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id, chat_id, city, street, house, interval_seconds,
+                       last_status_text, notifications_enabled
+                FROM users
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "user_id": row[0],
+        "chat_id": row[1],
+        "city": row[2],
+        "street": row[3],
+        "house": row[4],
+        "interval_seconds": row[5],
+        "last_status_text": row[6],
+        "notifications_enabled": row[7],
+    }
+
+
+def get_all_enabled_users() -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id, chat_id, city, street, house, interval_seconds,
+                       last_status_text, notifications_enabled
+                FROM users
+                WHERE notifications_enabled = TRUE
+                  AND city IS NOT NULL
+                  AND street IS NOT NULL
+                  AND house IS NOT NULL
+                """
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "user_id": row[0],
+            "chat_id": row[1],
+            "city": row[2],
+            "street": row[3],
+            "house": row[4],
+            "interval_seconds": row[5],
+            "last_status_text": row[6],
+            "notifications_enabled": row[7],
+        }
+        for row in rows
+    ]
+
+
+# =========================
+# Helpers
+# =========================
 
 def normalize_house(h: str) -> str:
     return h.strip()
@@ -263,6 +423,7 @@ def _main_menu_kb() -> ReplyKeyboardMarkup:
 
 def _parse_interval(text: str) -> Optional[int]:
     t = (text or "").strip().lower()
+
     m = re.match(r"^(\d{1,4})\s*(с|сек|секунд|s|sec)?$", t)
     if m:
         v = int(m.group(1))
@@ -276,9 +437,25 @@ def _parse_interval(text: str) -> Optional[int]:
     return None
 
 
+# =========================
+# Telegram handlers
+# =========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    record = get_user_record(user_id)
+
+    extra = ""
+    if record and record.get("city") and record.get("street") and record.get("house"):
+        extra = (
+            f"\n{EMO['db']} Збережена адреса:\n"
+            f"{record['city']}, {record['street']}, буд. {record['house']}\n"
+            f"{EMO['clock']} Інтервал: {record['interval_seconds']} с\n"
+        )
+
     await update.message.reply_text(
-        f"{EMO['sparkles']} DTEK-бот для перевірки відключень.\n\n"
+        f"{EMO['sparkles']} DTEK-бот для перевірки відключень.\n"
+        f"{extra}\n"
         f"/set — налаштувати адресу\n"
         f"/status — показати статус\n"
         f"/interval — змінити інтервал перевірки\n"
@@ -412,27 +589,47 @@ async def on_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
         return ConversationHandler.END
 
+    interval = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
+
     context.user_data["addr"] = {"city": city, "street": street, "house": house}
     context.user_data["last_status_text"] = msg
+    context.user_data["interval"] = interval
 
-    interval = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
+    save_user_address(
+        user_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+        city=city,
+        street=street,
+        house=house,
+        interval_seconds=interval,
+        last_status_text=msg,
+    )
 
     await update.message.reply_text(msg, reply_markup=_main_menu_kb())
     await _restart_watch_job(context, update.effective_user.id, update.effective_chat.id, interval)
     await update.message.reply_text(
-        f"{EMO['bell']} Сповіщення увімкнено.\n{EMO['clock']} Перевірка кожні {interval} с.",
+        f"{EMO['bell']} Сповіщення увімкнено.\n"
+        f"{EMO['clock']} Перевірка кожні {interval} с.\n"
+        f"{EMO['db']} Адресу збережено в базі.",
         reply_markup=_main_menu_kb(),
     )
     return ConversationHandler.END
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    addr_dict = context.user_data.get("addr")
-    if not addr_dict:
+    user_id = update.effective_user.id
+    record = get_user_record(user_id)
+
+    if not record or not record.get("city") or not record.get("street") or not record.get("house"):
         await update.message.reply_text(f"{EMO['warn']} Адресу не задано. Використай /set", reply_markup=_main_menu_kb())
         return
 
-    addr = Address(**addr_dict)
+    addr = Address(
+        city=record["city"],
+        street=record["street"],
+        house=record["house"],
+    )
+
     try:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
@@ -440,8 +637,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await update.message.reply_text(msg, reply_markup=_main_menu_kb())
 
-        # Оновлюємо останній текст, щоб бот далі порівнював з актуальним станом
+        context.user_data["addr"] = {"city": addr.city, "street": addr.street, "house": addr.house}
         context.user_data["last_status_text"] = msg
+        context.user_data["interval"] = record["interval_seconds"]
+
+        update_user_last_status(user_id, msg)
     except Exception as e:
         log.exception("status failed")
         await update.message.reply_text(f"{EMO['cross']} Помилка запиту до DTEK: {e}", reply_markup=_main_menu_kb())
@@ -452,6 +652,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     jobs = context.application.job_queue.get_jobs_by_name(job_name(user_id))
     for j in jobs:
         j.schedule_removal()
+
+    set_notifications_enabled(user_id, False)
+
     await update.message.reply_text(
         f"{EMO['stop']} Сповіщення вимкнено." if jobs else f"{EMO['info']} Сповіщення не активні.",
         reply_markup=_main_menu_kb(),
@@ -459,7 +662,14 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    current = int(context.user_data.get("interval", DEFAULT_CHECK_SECONDS))
+    record = get_user_record(update.effective_user.id)
+    current = int(
+        context.user_data.get(
+            "interval",
+            record["interval_seconds"] if record else DEFAULT_CHECK_SECONDS,
+        )
+    )
+
     kb = ReplyKeyboardMarkup(
         [
             ["30 с", "60 с", "90 с"],
@@ -489,13 +699,19 @@ async def on_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text(f"{EMO['warn']} Невірний формат.")
         return ASK_INTERVAL
 
+    user_id = update.effective_user.id
+    record = get_user_record(user_id)
+
     context.user_data["interval"] = v
+    update_user_interval(user_id, v)
 
-    addr = context.user_data.get("addr")
-    if addr:
-        await _restart_watch_job(context, update.effective_user.id, update.effective_chat.id, v)
+    if record and record.get("notifications_enabled") and record.get("chat_id"):
+        await _restart_watch_job(context, user_id, record["chat_id"], v)
 
-    await update.message.reply_text(f"{EMO['check']} Інтервал встановлено: {v} с.", reply_markup=_main_menu_kb())
+    await update.message.reply_text(
+        f"{EMO['check']} Інтервал встановлено: {v} с.\n{EMO['db']} Значення збережено в базі.",
+        reply_markup=_main_menu_kb(),
+    )
     return ConversationHandler.END
 
 
@@ -503,35 +719,37 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = context.job.data["user_id"]
     chat_id = context.job.data["chat_id"]
 
-    user_data = context.application.user_data.get(user_id)
-    if not user_data:
-        log.info("check_job: no user_data for user_id=%s", user_id)
+    record = get_user_record(user_id)
+    if not record:
+        log.info("check_job: no db record for user_id=%s", user_id)
         return
 
-    addr_dict = user_data.get("addr")
-    last_text = user_data.get("last_status_text")
-    if not addr_dict:
-        log.info("check_job: no addr for user_id=%s", user_id)
+    if not record.get("notifications_enabled"):
+        log.info("check_job: notifications disabled for user_id=%s", user_id)
         return
 
-    addr = Address(**addr_dict)
+    if not record.get("city") or not record.get("street") or not record.get("house"):
+        log.info("check_job: incomplete address for user_id=%s", user_id)
+        return
+
+    addr = Address(
+        city=record["city"],
+        street=record["street"],
+        house=record["house"],
+    )
 
     try:
         api_json = fetch_dtek(addr.city, addr.street)
         house_obj, ts = extract_house(api_json, addr.house)
-
         msg = format_status(addr, house_obj, ts)
 
-        log.info(
-            "check_job: user_id=%s changed=%s",
-            user_id,
-            msg != last_text,
-        )
+        old_text = record.get("last_status_text")
+        changed = msg != old_text
 
-        if msg != last_text:
-            user_data["last_status_text"] = msg
-            context.application.user_data[user_id] = user_data
+        log.info("check_job: user_id=%s changed=%s", user_id, changed)
 
+        if changed:
+            update_user_last_status(user_id, msg)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"{EMO['refresh']} Оновлення розкладу:\n\n{msg}",
@@ -559,15 +777,43 @@ async def on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
 
+# =========================
+# Restore jobs after restart
+# =========================
+
+async def restore_jobs(app) -> None:
+    users = get_all_enabled_users()
+    for user in users:
+        try:
+            app.job_queue.run_repeating(
+                check_job,
+                interval=user["interval_seconds"],
+                first=3,
+                name=job_name(user["user_id"]),
+                data={"user_id": user["user_id"], "chat_id": user["chat_id"]},
+            )
+            log.info(
+                "restored watch job: user_id=%s interval=%s",
+                user["user_id"],
+                user["interval_seconds"],
+            )
+        except Exception:
+            log.exception("failed to restore job for user_id=%s", user["user_id"])
+
+
 def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise SystemExit("Set BOT_TOKEN env var")
+    if not DATABASE_URL:
+        raise SystemExit("Set DATABASE_URL env var")
 
+    init_db()
     addr_book = load_address_book(ADDRESSES_FILE)
 
     app = ApplicationBuilder().token(token).build()
     app.bot_data["addr_book"] = addr_book
+    app.post_init = restore_jobs
 
     conv_set = ConversationHandler(
         entry_points=[
